@@ -28,6 +28,7 @@ label text differs slightly ('1-19' vs '0-19') but the bucket order is identical
 import openpyxl
 from collections import defaultdict
 import csv
+import statistics
 
 SOURCE_FILE = "/mnt/user-data/uploads/21st_Century_NFL_Field_Goal_Kicking_Performance.xlsx"
 
@@ -137,6 +138,26 @@ def kick_plus(agg_dict, min_att=0):
 
 
 # ---------------------------------------------------------------------------
+# Sample-size tiers (per V1 spec: 20+ ranked, 10-19 flagged, <10 unranked)
+# ---------------------------------------------------------------------------
+
+SEASON_FULL_MIN = 20
+SEASON_SMALL_SAMPLE_MIN = 10
+CAREER_RANK_MIN = 100          # min career attempts to appear on career leaderboards
+CONSISTENCY_MIN_SEASONS = 3    # min qualifying (20+ att) seasons to compute an SD
+BUCKET_RANK_MIN = 20           # min attempts within a single distance bucket to rank in that bucket's leaderboard
+
+
+def season_tier(att):
+    if att >= SEASON_FULL_MIN:
+        return "ranked"
+    elif att >= SEASON_SMALL_SAMPLE_MIN:
+        return "small_sample"
+    else:
+        return "unranked"
+
+
+# ---------------------------------------------------------------------------
 # Validation
 # ---------------------------------------------------------------------------
 
@@ -203,27 +224,70 @@ def main():
 
     run_validation(records, league, wb)
 
-    # ---- Career Kick+ (min 100 attempts) ----
-    by_player = aggregate(records, ("player",))
-    career = kick_plus(by_player, min_att=100)
-    career.sort(key=lambda x: -x[-1])
-    with open("/home/claude/kickplus/career_kick_plus.csv", "w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["player", "attempts", "made", "expected_made", "kick_plus"])
-        for row in career:
-            w.writerow([row[0], round(row[1]), round(row[2]), round(row[3], 1), round(row[4], 1)])
-
-    # ---- Season Kick+ (min 20 attempts in a season) ----
+    # ---- Season Kick+, ALL seasons (tiered: ranked / small_sample / unranked) ----
     by_player_year = aggregate(records, ("player", "year"))
-    seasons = kick_plus(by_player_year, min_att=20)
-    seasons.sort(key=lambda x: -x[-1])
+    all_seasons = kick_plus(by_player_year, min_att=1)   # keep every season, tag it, filter downstream
+    all_seasons.sort(key=lambda x: (x[0], x[1]))          # player, year order for readability
     with open("/home/claude/kickplus/season_kick_plus.csv", "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["player", "year", "attempts", "made", "expected_made", "kick_plus"])
-        for row in seasons:
-            w.writerow([row[0], row[1], round(row[2]), round(row[3]), round(row[4], 1), round(row[5], 1)])
+        w.writerow(["player", "year", "attempts", "made", "expected_made", "kick_plus", "tier"])
+        for row in all_seasons:
+            player, year, att, made, exp, kp = row
+            w.writerow([player, year, round(att), round(made), round(exp, 1), round(kp, 1), season_tier(att)])
 
-    # ---- Distance-bucket breakdown per player (career) ----
+    ranked_seasons = [r for r in all_seasons if season_tier(r[2]) == "ranked"]
+    ranked_seasons_sorted = sorted(ranked_seasons, key=lambda x: -x[-1])
+    with open("/home/claude/kickplus/leaderboard_best_season.csv", "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["rank", "player", "year", "attempts", "kick_plus"])
+        for i, row in enumerate(ranked_seasons_sorted, 1):
+            w.writerow([i, row[0], row[1], round(row[2]), round(row[-1], 1)])
+
+    # ---- Career Kick+ + seasons played + consistency (SD of ranked-season Kick+) ----
+    by_player = aggregate(records, ("player",))
+    career_all = {row[0]: row for row in kick_plus(by_player, min_att=1)}
+
+    # seasons played (any tier) and ranked-season Kick+ values, per player
+    seasons_played = defaultdict(int)
+    ranked_kp_by_player = defaultdict(list)
+    for player, year, att, made, exp, kp in all_seasons:
+        seasons_played[player] += 1
+        if season_tier(att) == "ranked":
+            ranked_kp_by_player[player].append(kp)
+
+    with open("/home/claude/kickplus/career_kick_plus.csv", "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["player", "attempts", "made", "expected_made", "career_kick_plus",
+                     "seasons_played", "n_ranked_seasons", "consistency_sd", "meets_career_rank_min"])
+        career_rows = []
+        for player, row in career_all.items():
+            _, att, made, exp, kp = row
+            ranked_kps = ranked_kp_by_player.get(player, [])
+            sd = round(statistics.stdev(ranked_kps), 1) if len(ranked_kps) >= CONSISTENCY_MIN_SEASONS else ""
+            career_rows.append((player, att, made, exp, kp, seasons_played[player], len(ranked_kps), sd))
+        career_rows.sort(key=lambda x: -x[4])
+        for player, att, made, exp, kp, n_seasons, n_ranked, sd in career_rows:
+            meets_min = att >= CAREER_RANK_MIN
+            w.writerow([player, round(att), round(made), round(exp, 1), round(kp, 1),
+                        n_seasons, n_ranked, sd, meets_min])
+
+    with open("/home/claude/kickplus/leaderboard_career.csv", "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["rank", "player", "attempts", "seasons_played", "career_kick_plus"])
+        qualified = [r for r in career_rows if r[1] >= CAREER_RANK_MIN]
+        qualified.sort(key=lambda x: -x[4])
+        for i, (player, att, made, exp, kp, n_seasons, n_ranked, sd) in enumerate(qualified, 1):
+            w.writerow([i, player, round(att), n_seasons, round(kp, 1)])
+
+    with open("/home/claude/kickplus/leaderboard_most_consistent.csv", "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["rank", "player", "n_ranked_seasons", "career_kick_plus", "consistency_sd"])
+        consistent = [r for r in career_rows if r[7] != ""]
+        consistent.sort(key=lambda x: x[7])   # lower SD = more consistent
+        for i, (player, att, made, exp, kp, n_seasons, n_ranked, sd) in enumerate(consistent, 1):
+            w.writerow([i, player, n_ranked, round(kp, 1), sd])
+
+    # ---- Distance-bucket breakdown per player (career) — full table for player pages ----
     by_player_bucket = aggregate(records, ("player", "bucket"))
     bucket_rows = kick_plus(by_player_bucket, min_att=1)
     with open("/home/claude/kickplus/career_kick_plus_by_bucket.csv", "w", newline="") as f:
@@ -232,8 +296,34 @@ def main():
         for row in bucket_rows:
             w.writerow([row[0], row[1], round(row[2]), round(row[3]), round(row[4], 1), round(row[5], 1)])
 
-    print(f"Wrote {len(career)} career rows, {len(seasons)} season rows, "
-          f"{len(bucket_rows)} player-bucket rows.")
+    # ---- Wide distance-profile table: one row per player, one column per bucket ----
+    profile = defaultdict(dict)
+    profile_att = defaultdict(dict)
+    for player, bucket, att, made, exp, kp in bucket_rows:
+        profile[player][bucket] = kp
+        profile_att[player][bucket] = att
+    with open("/home/claude/kickplus/kick_plus_distance_profile.csv", "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["player"] + [f"{b}_kick_plus" for b in BUCKETS] + [f"{b}_att" for b in BUCKETS])
+        for player in sorted(profile.keys()):
+            kp_cells = [round(profile[player].get(b, 0), 1) if b in profile[player] else "" for b in BUCKETS]
+            att_cells = [round(profile_att[player].get(b, 0)) if b in profile_att[player] else "" for b in BUCKETS]
+            w.writerow([player] + kp_cells + att_cells)
+
+    # ---- Per-distance-bucket leaderboards (50-59 and 60+, min BUCKET_RANK_MIN attempts) ----
+    for bucket in ["50-59", "60+"]:
+        rows = [r for r in bucket_rows if r[1] == bucket and r[2] >= BUCKET_RANK_MIN]
+        rows.sort(key=lambda x: -x[-1])
+        fname = f"/home/claude/kickplus/leaderboard_{bucket.replace('+','plus').replace('-','_')}.csv"
+        with open(fname, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["rank", "player", "attempts", "made", "kick_plus"])
+            for i, row in enumerate(rows, 1):
+                w.writerow([i, row[0], round(row[2]), round(row[3]), round(row[5], 1)])
+
+    print(f"Wrote {len(career_rows)} career rows ({len(qualified)} rank-eligible), "
+          f"{len(all_seasons)} season rows ({len(ranked_seasons)} ranked), "
+          f"{len(bucket_rows)} player-bucket rows, {len(consistent)} players with a consistency score.")
 
 
 if __name__ == "__main__":
