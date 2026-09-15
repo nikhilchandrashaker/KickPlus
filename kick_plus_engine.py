@@ -145,7 +145,32 @@ SEASON_FULL_MIN = 20
 SEASON_SMALL_SAMPLE_MIN = 10
 CAREER_RANK_MIN = 100          # min career attempts to appear on career leaderboards
 CONSISTENCY_MIN_SEASONS = 3    # min qualifying (20+ att) seasons to compute an SD
-BUCKET_RANK_MIN = 20           # min attempts within a single distance bucket to rank in that bucket's leaderboard
+
+# Tier-specific minimums for a kicker to APPEAR on that bucket's leaderboard.
+# (Exposure to 60+ attempts is inherently rare league-wide, so a flat 20-attempt
+# bar would exclude almost everyone from that leaderboard; 1-19 through 40-49 keep
+# the season-level bar since attempts are plentiful there.)
+BUCKET_LEADERBOARD_MIN = {
+    "<20": 20,
+    "20-29": 20,
+    "30-39": 20,
+    "40-49": 20,
+    "50-59": 15,
+    "60+": 5,
+}
+
+# Per-cell sample-size tagging for the distance profile (independent of whether
+# a kicker qualifies for that bucket's LEADERBOARD -- this governs what's shown
+# on an individual player page).
+def cell_sample_tag(att):
+    if att >= 40:
+        return "normal"          # 🟢
+    elif att >= 10:
+        return "moderate"        # 🟡
+    elif att >= 5:
+        return "small"           # 🔴 -- shown, but flagged
+    else:
+        return "insufficient"    # -- suppressed entirely, even if att > 0
 
 
 def season_tier(att):
@@ -297,24 +322,40 @@ def main():
             w.writerow([row[0], row[1], round(row[2]), round(row[3]), round(row[4], 1), round(row[5], 1)])
 
     # ---- Wide distance-profile table: one row per player, one column per bucket ----
+    # <5 attempts in a bucket: kick_plus is suppressed entirely ("insufficient sample"),
+    # not just flagged, per spec -- the number itself isn't shown, not even quietly.
     profile = defaultdict(dict)
     profile_att = defaultdict(dict)
+    profile_tag = defaultdict(dict)
     for player, bucket, att, made, exp, kp in bucket_rows:
-        profile[player][bucket] = kp
+        tag = cell_sample_tag(att)
+        profile[player][bucket] = kp if tag != "insufficient" else None
         profile_att[player][bucket] = att
+        profile_tag[player][bucket] = tag
     with open("/home/claude/kickplus/kick_plus_distance_profile.csv", "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["player"] + [f"{b}_kick_plus" for b in BUCKETS] + [f"{b}_att" for b in BUCKETS])
+        header = ["player"]
+        for b in BUCKETS:
+            header += [f"{b}_kick_plus", f"{b}_att", f"{b}_sample_tag"]
+        w.writerow(header)
         for player in sorted(profile.keys()):
-            kp_cells = [round(profile[player].get(b, 0), 1) if b in profile[player] else "" for b in BUCKETS]
-            att_cells = [round(profile_att[player].get(b, 0)) if b in profile_att[player] else "" for b in BUCKETS]
-            w.writerow([player] + kp_cells + att_cells)
+            row = [player]
+            for b in BUCKETS:
+                kp_val = profile[player].get(b)
+                att_val = profile_att[player].get(b, 0)
+                tag_val = profile_tag[player].get(b, "insufficient")
+                row += [round(kp_val, 1) if kp_val is not None else "", round(att_val) if att_val else "", tag_val if b in profile_att[player] else ""]
+            w.writerow(row)
 
-    # ---- Per-distance-bucket leaderboards (50-59 and 60+, min BUCKET_RANK_MIN attempts) ----
-    for bucket in ["50-59", "60+"]:
-        rows = [r for r in bucket_rows if r[1] == bucket and r[2] >= BUCKET_RANK_MIN]
+    # ---- Per-distance-bucket leaderboards, tier-specific minimums (see BUCKET_LEADERBOARD_MIN) ----
+    # NOTE: the minimum governs LEADERBOARD ELIGIBILITY only. The underlying Kick+ number
+    # (in career_kick_plus_by_bucket.csv / kick_plus_distance_profile.csv) is never altered
+    # by this threshold -- e.g. Aubrey's 60+ Kick+ stays exactly what it is either way.
+    for bucket, min_att in BUCKET_LEADERBOARD_MIN.items():
+        rows = [r for r in bucket_rows if r[1] == bucket and r[2] >= min_att]
         rows.sort(key=lambda x: -x[-1])
-        fname = f"/home/claude/kickplus/leaderboard_{bucket.replace('+','plus').replace('-','_')}.csv"
+        safe_name = bucket.replace("+", "plus").replace("-", "_").replace("<", "under")
+        fname = f"/home/claude/kickplus/leaderboard_{safe_name}.csv"
         with open(fname, "w", newline="") as f:
             w = csv.writer(f)
             w.writerow(["rank", "player", "attempts", "made", "kick_plus"])
